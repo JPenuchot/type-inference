@@ -88,12 +88,9 @@ module BaseTypeChecker = struct
     let add_var name typ = Env.add name typ env in
 
     match e with
-    | Int       _          -> TInt
-    | Bool      _          -> TBool
-    | Unit                 -> TUnit
-    | Var       n          -> find_typ n
-    | Op        op         -> find_typ op
-    | NewRef    e          -> TRef  (te e)
+    | Int       _  -> TInt          | Bool      _  -> TBool
+    | Unit         -> TUnit         | Var       n  -> find_typ n
+    | Op        op -> find_typ op   | NewRef    e  -> TRef  (te e)
     | Fun       (_, ta, e) -> TFun (ta, te e)
     | Pair      (e1, e2)   -> TPair (te e1, te e2)
     | Sequence  (e1, e2)   -> let _ = te e1 in te e2
@@ -174,12 +171,10 @@ module BaseTypeReconstruction = struct
     match elmt with
     (* Remplacement *)
     | TVar str when str == s -> new_t
-
     (* Récursions *)
     | TFun  (t1, t2) -> TFun  (ret t1, ret t2)
     | TPair (t1, t2) -> TPair (ret t1, ret t2)
     | TRef  t        -> TRef  (ret t)
-
     (* Rien à remplacer... *)
     | _ -> elmt
 
@@ -189,38 +184,28 @@ module BaseTypeReconstruction = struct
   and unif env1 env2 =
     try
       Env.fold (fun key elmt1 env_acc ->
-        match Env.find_opt key env1 with
-
-        (* Ajout d'un type *)
+        match Env.find_opt key env_acc with
+        (* Ajout d'un type manquant dans env_acc (construit à partir d'env2) *)
         | None -> Env.add key elmt1 env_acc
 
-        (* Conflit *)
-        | Some(elmt2) ->
-          let restart_with arg1 arg2 = raise ( UnifRec( arg1, arg2 ) ) in
+        (* Confrontation, on vérifie si les types sont les mêmes,
+         * si l'un d'eux est TVar s ou s'ils sont conflictuels *)
+        | Some elmt2 ->
+          let restart_with arg1 arg2 = raise ( UnifRec (arg1, arg2) ) in
           (match elmt1, elmt2 with
 
           (* Types identiques, aucun changement *)
           | a, b when a == b -> env_acc
 
-          (* Deux types indéterminés sont liés l'un à l'autre *)
-          | TVar s1, TVar s2 when not (s1 == s2) ->
-            restart_with  (replace_in_env env1    s2 elmt1)
-                          (replace_in_env env_acc s2 elmt1)
+          (* L'un d'eux est TVar s, on unifie *)
+          | TVar s, t | t, TVar s ->
+            restart_with (replace_in_env env1    s  t)
+                         (replace_in_env env_acc s  t)
 
-          (* Unification depuis env1 *)
-          | _, TVar s ->
-            restart_with  (replace_in_env env1    s  elmt1)
-                          (replace_in_env env_acc s  elmt1)
-
-          (* Unification depuis env2 *)
-          | TVar s, _ ->
-            restart_with  (replace_in_env env1    s  elmt2)
-                          (replace_in_env env_acc s  elmt2)
-
-          (* Conflit entre deux types non indéterminés, erreur *)
+          (* Sinon il y a conflit, donc erreur *)
           | _ -> failwith "Conflicting types"
           )
-      ) env1 env2
+      ) (* Iter on : *) env1 (* Acc : *) env2
     (* Récursion lors d'une exception de type UnifRec *)
     with UnifRec (nenv1, nenv2) -> unif nenv1 nenv2
 
@@ -389,11 +374,139 @@ end
      type [T?], on pourra donner à [a] le type [T] dans la branche [e₂].
 *)
 module SubTypeChecker = struct
+  open OptionTypes
+  open SubAST
 
+  module Env = Map.Make(String)
+  type type_env = typ Env.t
+  exception UnifRec of (type_env * type_env)
+
+  (* Remplace les TVar(s) récursivement dans un type donné *)
+  let rec replace_in_type s new_t elmt =
+    let ret = replace_in_type s new_t in
+    match elmt with
+    (* Remplacement *)
+    | TVar str when str == s -> new_t
+
+    (* Récursions *)
+    | TFun   (t1, t2) -> TFun   (ret t1, ret t2)
+    | TPair  (t1, t2) -> TPair  (ret t1, ret t2)
+    | TRef   t -> TRef   (ret t)
+    | TMaybe t -> TMaybe (ret t)
+
+    (* Rien à remplacer... *)
+    | _ -> elmt
+
+  and replace_in_env env s new_t = Env.map (replace_in_type s new_t) env
+
+  (* Fonction d'unification *)
+  and unif env1 env2 =
+    try
+      Env.fold (fun key elmt1 env_acc ->
+        match Env.find_opt key env_acc with
+        (* Ajout d'un type manquant dans env_acc (construit à partir d'env2) *)
+        | None -> Env.add key elmt1 env_acc
+
+        (* Confrontation, on vérifie si les types sont les mêmes,
+         * si l'un d'eux est TVar s ou s'ils sont conflictuels *)
+        | Some elmt2 ->
+          let restart_with arg1 arg2 = raise ( UnifRec (arg1, arg2) ) in
+          (match elmt1, elmt2 with
+
+          (* Types identiques, aucun changement *)
+          | a, b when a == b -> env_acc
+
+          (* L'un d'eux est TVar s, on unifie *)
+          | TVar s, t | t, TVar s ->
+            restart_with (replace_in_env env1    s  t)
+                         (replace_in_env env_acc s  t)
+
+          (* Sinon il y a conflit, donc erreur *)
+          | _ -> failwith "Conflicting types"
+          )
+      ) (* Iter on : *) env1 (* Acc : *) env2
+    (* Récursion lors d'une exception de type UnifRec *)
+    with UnifRec (nenv1, nenv2) -> unif nenv1 nenv2
+
+  (**
+      Objectif : compléter la fonction suivante de typage d'une expression.
+      Un appel [type_expression e] doit :
+      - renvoyer le type de [e] dans l'environnement [env] si [e] est bien typée
+      - déclencher une exception sinon
+
+      Procéder en deux étapes : génération de contraintes sur les types,
+      puis résolution par unification.
+  *)
+  let rec type_expression (env: type_env) (e: expression) : (type_env * typ) =
+    (* Funlets *)
+
+    let te = type_expression env
+    and find_typ name = Env.find name env
+    in
+
+    match e with
+    (* Cas triviaux *)
+    | Int    _  -> env, TInt        | Bool _ -> env, TBool
+    | Unit      -> env, TUnit       | Var  n -> env, find_typ n
+    | Op     op -> env, find_typ op
+
+    | NewRef t  -> failwith "Not implemented"
+
+    (* Require unification *)
+
+    (* Special case of unification *)
+    | Pair (e1, e2) ->
+      let nenv1, t1 = te e1 and nenv2, t2 = te e2 in
+      let nenv = unif nenv1 nenv2 in
+      (match type_expression nenv e1 , type_expression nenv e2 with
+
+        (* Les types n'ont pas changé, on renvoie après unification *)
+      | (ne1, nt1), (ne2, nt2) when (t1 == nt1) && (t2 == nt2) ->
+        unif ne1 ne2, TPair(nt1, nt2)
+
+        (* Sinon on recalcule (jusqu'à ce que les types ne changent plus) *)
+      | (ne1, nt1), (ne2, nt2) -> type_expression (unif ne1 ne2) e
+      )
+
+    | Sequence (e1, e2) ->
+      let (env1, _ ) = te e1 and (env2, _) = te e2
+      in type_expression (unif env1 env2) e2
+
+    | While (c, e) ->
+      let envc , _ = te c
+      and enve , _ = te e in
+      let nenv = (unif envc enve) in
+      (match type_expression nenv c with
+      | _, TBool -> nenv, TUnit
+      | _ -> failwith "Condition expression is not boolean."
+      )
+
+    | If (c, e1, e2) ->
+      let envc, _ = te c
+      and env1, _ = te e1
+      and env2, _ = te e2 in
+      let nenv = unif (unif env1 env2) envc in
+      (match type_expression nenv c , type_expression nenv e1
+                                    , type_expression nenv e2 with
+      | (_, TBool) , (_, t1) , (_, t2) when t1 == t2 -> nenv, t1
+      | _ ->
+        failwith "Condition is not a boolean or incompatible branche types."
+      )
+
+    | Let (name, e_bind, e) ->
+      let enve, te_bind = te e_bind in
+      let nenv = Env.add name te_bind enve in
+      type_expression nenv e
+
+    | App (e1, e2) ->
+      let env1, _ = te e1
+      and env2, _ = te e2 in
+      let nenv    = unif env1 env2 in
+      (match type_expression nenv e1 , type_expression nenv e2 with
+      | (_, TFun(targ, tret)) , (_, t2) when targ == t2 -> nenv, tret
+      | _ -> failwith "Bad application"
+      )
+
+    | Fun (n, t, e) -> failwith "Not implemented"
 
 end
-
-
-(**
-   Exercice 4 : combiner l'inférence (exercice 2) et le sous-typage (exercice 3)
-*)
