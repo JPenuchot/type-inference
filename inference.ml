@@ -88,40 +88,37 @@ module BaseTypeChecker = struct
     let add_var name typ = Env.add name typ env in
 
     match e with
-    | Int       (_)             ->  TInt
-    | Bool      (_)             ->  TBool
-    | Unit                      ->  TUnit
+    | Int       _          -> TInt
+    | Bool      _          -> TBool
+    | Unit                 -> TUnit
+    | Var       n          -> find_typ n
+    | Op        op         -> find_typ op
+    | NewRef    e          -> TRef  (te e)
+    | Fun       (_, ta, e) -> TFun (ta, te e)
+    | Pair      (e1, e2)   -> TPair (te e1, te e2)
+    | Sequence  (e1, e2)   -> let _ = te e1 in te e2
+    | While     (c, e)     -> let _ = te c and _ = te e in TUnit
 
-    | Var       (n)             ->  find_typ n
-    | Op        (op)            ->  find_typ op
+    | If (c, et, ef) ->
+      if not ((te c) == TBool)
+      then  failwith "HADOUKEN"
+      else  let tt = te et and tf = te ef in
+            if not (tt == tf)
+              then failwith "KAMEHAMEHA"
+              else tt
 
-    | NewRef    (e)             ->  TRef  (te e)
-    | Fun       (_, ta, e)      ->  TFun (ta, te e)
-    | Pair      (e1, e2)        ->  TPair (te e1, te e2)
+    | App (e1, e2) ->
+      let tf = te e1 and te = te e2 in
+      (match tf with
+      | TFun (targ, tret) when targ == te -> tret
+      | _ -> failwith "Nooope, Chuck Testa."
+      )
 
-    | Sequence  (e1, e2)        ->  let _ = te e1 in te e2
-    | While     (c, e)          ->  let _ = te c and _ = te e in TUnit
-
-    | If        (c, et, ef)     ->  if not ((te c) == TBool)
-                                    then  failwith "HADOUKEN"
-                                    else  let tt = te et in
-                                          let tf = te ef in
-                                          if not (tt == tf)
-                                          then failwith "KAMEHAMEHA"
-                                          else tt
-
-    | App       (e1, e2)        ->  let tf = te e1 in
-                                    let te = te e2 in
-                                    ( match tf with
-                                      | TFun(targ, tret) when targ == te -> tret
-                                      | _ -> failwith "Nooope, Chuck Testa."
-                                    )
-
-    | Let       (vname, e1, e2) ->  let nenv = add_var vname (te e1) in
-                                    type_expression nenv e2
+    | Let (vname, e1, e2) ->
+      let nenv = add_var vname (te e1) in
+      type_expression nenv e2
 
 end
-
 
 (**
     Exercice 2 : inférence des types simples.
@@ -221,7 +218,7 @@ module BaseTypeReconstruction = struct
                           (replace_in_env env_acc s  elmt2)
 
           (* Conflit entre deux types non indéterminés, erreur *)
-          | _ , _ -> failwith "Conflicting types"
+          | _ -> failwith "Conflicting types"
           )
       ) env1 env2
     (* Récursion lors d'une exception de type UnifRec *)
@@ -244,22 +241,16 @@ module BaseTypeReconstruction = struct
     in
 
     match e with
-    (* Pas de d'unification d'environnements -> trivial *)
-    | Int    _  -> env, TInt        | Bool _  -> env, TBool
-    | Unit      -> env, TUnit       | Var  n  -> env, find_typ n
+    (* Cas triviaux *)
+    | Int    _  -> env, TInt        | Bool _ -> env, TBool
+    | Unit      -> env, TUnit       | Var  n -> env, find_typ n
     | Op     op -> env, find_typ op
-    | Newref e  ->  let nenv, t = te e in nenv, TRef(t)
+    | Newref e  -> let nenv, t = te e in nenv, TRef(t)
 
     (* Require unification *)
 
-    (* Inference on e2 *)
-    | App      (e1, e2)     -> failwith "App inference implemented"
-
-    (* Unification using environment returned by e *)
-    | Fun      (n, e)       -> failwith "Fun inference implemented"
-
     (* Special case of unification *)
-    | Pair     (e1, e2)     ->
+    | Pair (e1, e2) ->
       let nenv1, t1 = te e1 and nenv2, t2 = te e2 in
       let nenv = unif nenv1 nenv2 in
       (match type_expression nenv e1 , type_expression nenv e2 with
@@ -272,19 +263,50 @@ module BaseTypeReconstruction = struct
       | (ne1, nt1), (ne2, nt2) -> type_expression (unif ne1 ne2) e
       )
 
-    | While    (c, e)       ->
-      (match te c with
-      | c_env, TBool -> let nenv = unif env c_env in
-                        (match type_expression nenv e with
-                        | nnenv, _ -> (unif nenv nnenv) , TUnit
-                        )
-      (* Condition non booléenne : on pleure *)
-      | _ , _ -> failwith "Condition expression is not boolean."
+    | Sequence (e1, e2) ->
+      let (env1, _ ) = te e1 and (env2, _) = te e2
+      in type_expression (unif env1 env2) e2
+
+    | While (c, e) ->
+      let envc , _ = te c
+      and enve , _ = te e in
+      let nenv = (unif envc enve) in
+      (match type_expression nenv c with
+      | _, TBool -> nenv, TUnit
+      | _ -> failwith "Condition expression is not boolean."
       )
 
-    | Sequence (e1, e2)     -> failwith "Sequence inference implemented"
-    | If       (c, e1, e2)  -> failwith "If inference implemented"
-    | Let      (n, v, e)    -> failwith "Let inference implemented"
+    | If (c, e1, e2) ->
+      let envc, _ = te c
+      and env1, _ = te e1
+      and env2, _ = te e2 in
+      let nenv = unif (unif env1 env2) envc in
+      (match type_expression nenv c , type_expression nenv e1
+                                    , type_expression nenv e2 with
+      | (_, TBool) , (_, t1) , (_, t2) when t1 == t2 -> nenv, t1
+      | _ ->
+        failwith "Condition is not a boolean or incompatible branche types."
+      )
+
+    | Let (name, e_bind, e) ->
+      let enve, te_bind = te e_bind in
+      let nenv = Env.add name te_bind enve in
+      type_expression nenv e
+
+    | App (e1, e2) ->
+      let env1, _ = te e1
+      and env2, _ = te e2 in
+      let nenv    = unif env1 env2 in
+      (match type_expression nenv e1 , type_expression nenv e2 with
+      | (_, TFun(targ, tret)) , (_, t2) when targ == t2 -> nenv, tret
+      | _ -> failwith "Bad application"
+      )
+
+    | Fun (n, e) ->
+      (match te e with
+      | nenv, t when t == (Env.find n nenv) -> nenv, t
+      | _ -> failwith "ok"
+      )
 
 end
 
